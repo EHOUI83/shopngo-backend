@@ -34,8 +34,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
     const session = event.data.object;
     saveOrder(session);
     console.log('✅ Nouvelle commande payée:', session.id, session.amount_total / 100, session.currency);
-    // Piste d'amélioration : envoyer un email ou un message Telegram ici
-    // pour être notifié en temps réel qu'il faut commander chez le fournisseur.
+    notifyTelegram(session).catch(err => console.error('Erreur notification Telegram:', err.message));
   }
 
   res.json({ received: true });
@@ -68,11 +67,15 @@ app.post('/create-checkout-session', async (req, res) => {
       payment_method_types: ['card'],
       line_items,
       customer_email: customerEmail || undefined,
+      // Sans ça, impossible de savoir où livrer le client une fois payé.
+      shipping_address_collection: {
+        allowed_countries: ['FR', 'BE', 'CH', 'LU', 'MC', 'DE', 'ES', 'IT', 'GB', 'US', 'CA']
+      },
       // On garde le détail du panier (id produit + lien fournisseur) dans les métadonnées
       // pour retrouver facilement quoi commander chez le fournisseur après le paiement.
       metadata: {
         cart: JSON.stringify(
-          items.map((i) => ({ id: i.productId, qty: i.quantity, supplierUrl: i.supplierUrl || '' }))
+          items.map((i) => ({ id: i.productId, name: i.name, qty: i.quantity, supplierUrl: i.supplierUrl || '' }))
         ),
       },
       success_url: `${SITE_URL}?checkout=success`,
@@ -112,10 +115,43 @@ function saveOrder(session) {
     amountTotal: session.amount_total / 100,
     currency: session.currency,
     customerEmail: session.customer_details ? session.customer_details.email : null,
+    customerName: session.customer_details ? session.customer_details.name : null,
+    shippingAddress: session.shipping_details ? session.shipping_details.address : null,
     cart,
     fulfilled: false, // passe à true une fois que tu as commandé chez le fournisseur
   });
   fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2));
+}
+
+// Envoie un message Telegram dès qu'une commande est payée, pour être prévenu en temps réel.
+async function notifyTelegram(session) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return; // notification non configurée, on ignore silencieusement
+
+  let cart = [];
+  try { cart = JSON.parse(session.metadata.cart || '[]'); } catch {}
+
+  const addr = session.shipping_details ? session.shipping_details.address : null;
+  const addrText = addr
+    ? `${addr.line1 || ''}${addr.line2 ? ', ' + addr.line2 : ''}, ${addr.postal_code || ''} ${addr.city || ''}, ${addr.country || ''}`
+    : 'Adresse non fournie';
+
+  const itemsText = cart.map(i => `• ${i.name} x${i.qty}${i.supplierUrl ? '\n  🔗 ' + i.supplierUrl : ''}`).join('\n');
+
+  const text =
+    `🛒 Nouvelle commande Shop'N'Go\n\n` +
+    `💰 Montant : ${(session.amount_total / 100).toFixed(2)} ${session.currency.toUpperCase()}\n` +
+    `👤 Client : ${session.customer_details ? session.customer_details.name : 'N/A'}\n` +
+    `✉️ Email : ${session.customer_details ? session.customer_details.email : 'N/A'}\n` +
+    `📦 Adresse : ${addrText}\n\n` +
+    `Articles :\n${itemsText}`;
+
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text })
+  });
 }
 
 const PORT = process.env.PORT || 4242;
