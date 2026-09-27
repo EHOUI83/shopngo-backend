@@ -1,6 +1,7 @@
 // Shop'N'Go — backend minimal pour encaisser de vrais paiements avec Stripe.
 // Ce serveur ne parle à aucune appli tierce (pas de Shopify, pas de DSers) :
 // juste Stripe pour le paiement, et un fichier local pour noter les commandes payées.
+// + Notifications Telegram pour les commandes MAISON SIGNATURE (paire, pointure, adresse).
 
 require('dotenv').config();
 const express = require('express');
@@ -25,6 +26,19 @@ const TELEGRAM_PRODUCT_CHAT_ID = process.env.TELEGRAM_PRODUCT_CHAT_ID;
 // L'adresse publique de CE serveur, pour construire les liens d'images uploadées.
 // Sur Render, elle est fournie automatiquement dans RENDER_EXTERNAL_URL.
 const SERVER_URL = process.env.RENDER_EXTERNAL_URL || process.env.SERVER_URL || 'http://localhost:4242';
+
+// ---------- MAISON SIGNATURE : noms des paires ----------
+// Le site envoie à Stripe une référence du type "foret_T42" (paire + pointure).
+const MAISON_SIGNATURE_PAIRES = {
+  foret: 'Forêt Usée',
+  nuit: 'Nuit Éclaboussée',
+  encre: 'Encre Brute',
+  poussiere: 'Rose Poussière',
+  rouille: 'Coulée Rouille',
+  terre: 'Terre Brute',
+  esquisse: 'Esquisse Rouge',
+  sable: 'Sable Brûlé',
+};
 
 // Le webhook Stripe a besoin du corps brut (raw) de la requête pour vérifier
 // la signature — donc on le déclare AVANT express.json() qui parse tout en JSON.
@@ -265,20 +279,47 @@ function readOrders() {
   }
 }
 
+// Stripe range maintenant l'adresse de livraison dans "collected_information".
+// Cette fonction la retrouve, quel que soit l'endroit où Stripe l'a mise.
+function getShipping(session) {
+  const sd = (session.collected_information && session.collected_information.shipping_details)
+    || session.shipping_details
+    || null;
+  const addr = (sd && sd.address)
+    || (session.customer_details && session.customer_details.address)
+    || null;
+  return { name: sd ? sd.name : null, addr };
+}
+
+// Une commande Maison Signature vient d'un lien de paiement Stripe
+// ou porte une référence du site (ex : "foret_T42").
+function getMaisonSignature(session) {
+  const ref = session.client_reference_id || '';
+  const [code, taille] = ref.split('_T');
+  const isMaison = !!session.payment_link || !!MAISON_SIGNATURE_PAIRES[code];
+  return { isMaison, paire: MAISON_SIGNATURE_PAIRES[code] || null, taille: taille || null, ref };
+}
+
 function saveOrder(session) {
   const orders = readOrders();
   let cart = [];
   try {
-    cart = JSON.parse(session.metadata.cart || '[]');
+    cart = JSON.parse((session.metadata && session.metadata.cart) || '[]');
   } catch {}
+  const { addr } = getShipping(session);
+  const ms = getMaisonSignature(session);
   orders.push({
     id: session.id,
+    boutique: ms.isMaison ? 'Maison Signature' : "Shop'N'Go",
     date: new Date().toISOString(),
     amountTotal: session.amount_total / 100,
     currency: session.currency,
     customerEmail: session.customer_details ? session.customer_details.email : null,
     customerName: session.customer_details ? session.customer_details.name : null,
-    shippingAddress: session.shipping_details ? session.shipping_details.address : null,
+    customerPhone: session.customer_details ? session.customer_details.phone : null,
+    shippingAddress: addr,
+    paire: ms.paire,
+    pointure: ms.taille,
     cart,
     fulfilled: false, // passe à true une fois que tu as commandé chez le fournisseur
   });
@@ -291,23 +332,51 @@ async function notifyTelegram(session) {
   const chatId = process.env.TELEGRAM_CHAT_ID;
   if (!token || !chatId) return; // notification non configurée, on ignore silencieusement
 
-  let cart = [];
-  try { cart = JSON.parse(session.metadata.cart || '[]'); } catch {}
-
-  const addr = session.shipping_details ? session.shipping_details.address : null;
+  const cd = session.customer_details || {};
+  const { name: shipName, addr } = getShipping(session);
   const addrText = addr
-    ? `${addr.line1 || ''}${addr.line2 ? ', ' + addr.line2 : ''}, ${addr.postal_code || ''} ${addr.city || ''}, ${addr.country || ''}`
+    ? [shipName, addr.line1, addr.line2, [addr.postal_code, addr.city].filter(Boolean).join(' '), addr.country]
+        .filter(Boolean).join('\n')
     : 'Adresse non fournie';
+  const montant = `${(session.amount_total / 100).toFixed(2).replace('.', ',')} ${session.currency.toUpperCase()}`;
 
-  const itemsText = cart.map(i => `• ${i.name} x${i.qty}${i.supplierUrl ? '\n  🔗 ' + i.supplierUrl : ''}`).join('\n');
+  let text;
+  const ms = getMaisonSignature(session);
 
-  const text =
-    `🛒 Nouvelle commande Shop'N'Go\n\n` +
-    `💰 Montant : ${(session.amount_total / 100).toFixed(2)} ${session.currency.toUpperCase()}\n` +
-    `👤 Client : ${session.customer_details ? session.customer_details.name : 'N/A'}\n` +
-    `✉️ Email : ${session.customer_details ? session.customer_details.email : 'N/A'}\n` +
-    `📦 Adresse : ${addrText}\n\n` +
-    `Articles :\n${itemsText}`;
+  if (ms.isMaison) {
+    // ---------- Commande MAISON SIGNATURE ----------
+    let paire = ms.paire;
+    if (!paire) {
+      // Si le client est passé directement par le lien Stripe (sans le site),
+      // on récupère le nom du produit chez Stripe.
+      try {
+        const items = await stripe.checkout.sessions.listLineItems(session.id, { limit: 5 });
+        paire = items.data.map(i => i.description).join(', ');
+      } catch {}
+    }
+    text =
+      `👟 NOUVELLE COMMANDE – MAISON SIGNATURE\n\n` +
+      `👟 Paire : ${paire || 'Inconnue'}\n` +
+      `📏 Pointure : ${ms.taille || 'non indiquée'}\n` +
+      `💰 Payé : ${montant}\n\n` +
+      `👤 Client : ${cd.name || 'N/A'}\n` +
+      `✉️ Email : ${cd.email || 'N/A'}\n` +
+      `📞 Téléphone : ${cd.phone || 'N/A'}\n\n` +
+      `📦 Livraison :\n${addrText}\n\n` +
+      `🧾 Réf. : ${ms.ref || session.id.slice(-10)}`;
+  } else {
+    // ---------- Commande SHOP'N'GO (inchangé, adresse corrigée) ----------
+    let cart = [];
+    try { cart = JSON.parse((session.metadata && session.metadata.cart) || '[]'); } catch {}
+    const itemsText = cart.map(i => `• ${i.name} x${i.qty}${i.supplierUrl ? '\n  🔗 ' + i.supplierUrl : ''}`).join('\n');
+    text =
+      `🛒 Nouvelle commande Shop'N'Go\n\n` +
+      `💰 Montant : ${montant}\n` +
+      `👤 Client : ${cd.name || 'N/A'}\n` +
+      `✉️ Email : ${cd.email || 'N/A'}\n` +
+      `📦 Adresse :\n${addrText}\n\n` +
+      `Articles :\n${itemsText}`;
+  }
 
   await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
