@@ -43,16 +43,19 @@ const MAISON_SIGNATURE_PAIRES = {
 // Le webhook Stripe a besoin du corps brut (raw) de la requête pour vérifier
 // la signature — donc on le déclare AVANT express.json() qui parse tout en JSON.
 app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      req.headers['stripe-signature'],
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    console.error('Signature webhook invalide:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+  // On accepte les événements de Shop'N'Go ET de Maison Signature (mode réel) :
+  // chaque compte Stripe a son propre secret de webhook.
+  const secrets = [process.env.STRIPE_WEBHOOK_SECRET, process.env.STRIPE_WEBHOOK_SECRET_MS].filter(Boolean);
+  let event, lastErr;
+  for (const secret of secrets) {
+    try {
+      event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], secret);
+      break;
+    } catch (err) { lastErr = err; }
+  }
+  if (!event) {
+    console.error('Signature webhook invalide:', lastErr && lastErr.message);
+    return res.status(400).send(`Webhook Error: ${lastErr ? lastErr.message : 'aucun secret configuré'}`);
   }
 
   if (event.type === 'checkout.session.completed') {
